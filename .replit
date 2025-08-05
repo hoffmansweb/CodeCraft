@@ -2,7 +2,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["libyaml", "xcodebuild", "zlib", "mesa", "xorg.libX11", "xorg.libXext", "xorg.libXrender", "xorg.libXi", "xorg.libXtst", "fontconfig", "freetype", "libglvnd", "xvfb-run", "libxkbcommon", "zstd", "dbus"]
+packages = ["dbus", "fontconfig", "freetype", "libglvnd", "libxkbcommon", "libyaml", "mesa", "xcodebuild", "xorg.libX11", "xorg.libXext", "xorg.libXi", "xorg.libXrender", "xorg.libXtst", "xvfb-run", "zlib", "zstd"]
 
 [workflows]
 runButton = "Project"
