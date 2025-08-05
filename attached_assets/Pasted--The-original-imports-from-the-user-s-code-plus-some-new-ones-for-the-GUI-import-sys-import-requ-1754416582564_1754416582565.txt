@@ -1,0 +1,1132 @@
+# The original imports from the user's code, plus some new ones for the GUI
+import sys
+import requests
+from bs4 import BeautifulSoup
+from bs4.element import Tag
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QTextEdit, QTreeWidget, QTreeWidgetItem, QLabel, QMessageBox,
+    QProgressBar, QTabWidget, QGraphicsView, QGraphicsScene, QGraphicsRectItem,
+    QFormLayout, QCheckBox, QLineEdit, QScrollArea, QGraphicsTextItem, QDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QComboBox, QInputDialog,
+    QGridLayout, QFrame, QSizePolicy, QSpacerItem, QToolBar, QStatusBar,
+    QMenu, QDialogButtonBox, QSpinBox, QDoubleSpinBox
+)
+from PyQt6.QtCore import (
+    Qt, QObject, QThread, pyqtSignal, QMimeData, QByteArray, QDataStream,
+    QIODevice, QTimer, QSize, QRectF, QPoint, QPointF, QRect
+)
+from PyQt6.QtGui import (
+    QDrag, QColor, QPen, QBrush, QPainter, QPixmap, QTextCursor, QFont,
+    QAction, QIcon
+)
+import re
+import time
+from collections import deque
+import sqlite3
+from datetime import datetime
+import yaml
+import uuid
+import json
+
+# --- 1. Data Structures (from user's code) ---
+# The classes below were provided by the user and are used as-is.
+
+class ConfigVariable:
+    """Represents a configuration variable for an ESPHome component."""
+    def __init__(self, name, description, data_type, is_required, default_value=None):
+        self.name = name
+        self.description = description
+        self.data_type = data_type
+        self.is_required = is_required
+        self.default_value = default_value
+        self.current_value = None  # To store user-configured value
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "description": self.description,
+            "data_type": self.data_type,
+            "is_required": self.is_required,
+            "default_value": self.default_value
+        }
+
+class ESPHomeComponent:
+    """Represents an ESPHome component (e.g., 'switch', 'sensor.dht')."""
+    def __init__(self, name, component_type, description, platforms=None, config_vars=None, url=None):
+        self.name = name
+        self.component_type = component_type
+        self.description = description
+        self.platforms = platforms if platforms is not None else []
+        self.config_vars = config_vars if config_vars is not None else []
+        self.url = url
+        self.instance_id = None # Unique ID for each instance on the canvas
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "component_type": self.component_type,
+            "description": self.description,
+            "platforms": self.platforms,
+            "config_vars": [cv.to_dict() for cv in self.config_vars],
+            "url": self.url
+        }
+
+# --- 2. Web Scraper (from user's code, with a completed `run_scraping` method) ---
+
+class ESPHomeScraper(QObject):
+    """
+    Scrapes ESPHome component information from the official documentation.
+    A robust scraper that handles various parsing patterns and includes delays.
+    """
+    log_message = pyqtSignal(str)
+    status_update = pyqtSignal(str)
+    progress_update = pyqtSignal(int, int, str)
+    component_found = pyqtSignal(str, ESPHomeComponent)
+    scraping_finished = pyqtSignal()
+    scraping_error = pyqtSignal(str)
+
+    BASE_URL = "https://esphome.io"
+    COMPONENTS_URL = f"{BASE_URL}/components/"
+    DB_NAME = "esphome_components.db"
+
+    def __init__(self):
+        super().__init__()
+        self._is_canceled = False
+        self.components_data = {}
+        self._init_db()
+
+    def _init_db(self):
+        """Initializes the SQLite database and creates tables if they don't exist."""
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS components (
+                    component_key TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    component_type TEXT NOT NULL,
+                    description TEXT,
+                    platforms TEXT, -- Stored as comma-separated string or JSON
+                    url TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS config_variables (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    component_key TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    data_type TEXT,
+                    is_required INTEGER, -- 0 for False, 1 for True
+                    default_value TEXT,
+                    FOREIGN KEY (component_key) REFERENCES components (component_key) ON DELETE CASCADE
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    message TEXT NOT NULL
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS yaml_configs (
+                    id TEXT PRIMARY KEY,
+                    config_data TEXT NOT NULL
+                )
+            ''')
+            conn.commit()
+            conn.close()
+            self.log_message.emit("SQLite database initialized successfully.")
+        except sqlite3.Error as e:
+            self.log_message.emit(f"Error initializing database: {e}")
+
+    def _save_single_component_to_db(self, comp: ESPHomeComponent):
+        """Saves or updates a single component and its variables to the SQLite database."""
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+            
+            component_key = f"{comp.component_type}.{comp.name.lower().replace(' ', '_').replace('.', '_')}"
+            platforms_str = ",".join(comp.platforms)
+
+            cursor.execute('''
+                INSERT OR REPLACE INTO components (component_key, name, component_type, description, platforms, url)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (component_key, comp.name, comp.component_type, comp.description, platforms_str, comp.url))
+
+            cursor.execute("DELETE FROM config_variables WHERE component_key = ?", (component_key,))
+
+            for var in comp.config_vars:
+                cursor.execute('''
+                    INSERT INTO config_variables (component_key, name, description, data_type, is_required, default_value)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (component_key, var.name, var.description, var.data_type, int(var.is_required), var.default_value))
+            
+            conn.commit()
+            conn.close()
+            self.log_message.emit(f"Saved/Updated component '{comp.name}' to database.")
+        except sqlite3.Error as e:
+            self.log_message.emit(f"Error saving component '{comp.name}' to database: {e}")
+
+    def _save_log_to_db(self, message):
+        """Saves a single log message to the SQLite database."""
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute("INSERT INTO logs (timestamp, message) VALUES (?, ?)", (timestamp, message))
+            conn.commit()
+            conn.close()
+        except sqlite3.Error as e:
+            print(f"Error saving log to database: {e} - Message: {message}")
+
+    def save_yaml_config(self, config_id: str, yaml_string: str):
+        """Saves a YAML configuration string to the database."""
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO yaml_configs (id, config_data)
+                VALUES (?, ?)
+            ''', (config_id, yaml_string))
+            conn.commit()
+            conn.close()
+            self.log_message.emit(f"YAML configuration '{config_id}' saved to database.")
+            return True
+        except sqlite3.Error as e:
+            self.log_message.emit(f"Error saving YAML configuration '{config_id}' to database: {e}")
+            return False
+
+    def load_yaml_config(self, config_id: str):
+        """Loads a YAML configuration string from the database."""
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("SELECT config_data FROM yaml_configs WHERE id = ?", (config_id,))
+            result = cursor.fetchone()
+            conn.close()
+            if result:
+                self.log_message.emit(f"YAML configuration '{config_id}' loaded from database.")
+                return result[0]
+            else:
+                self.log_message.emit(f"No YAML configuration found for ID '{config_id}'.")
+                return None
+        except sqlite3.Error as e:
+            self.log_message.emit(f"Error loading YAML configuration '{config_id}' from database: {e}")
+            return None
+
+    def load_components_from_db(self):
+        """Loads components from the SQLite database into self.components_data."""
+        loaded_components = {}
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT component_key, name, component_type, description, platforms, url FROM components")
+            components_rows = cursor.fetchall()
+
+            for row in components_rows:
+                component_key, name, component_type, description, platforms_str, url = row
+                platforms = platforms_str.split(',') if platforms_str else []
+
+                config_vars = []
+                cursor.execute("SELECT name, description, data_type, is_required, default_value FROM config_variables WHERE component_key = ?", (component_key,))
+                variables_rows = cursor.fetchall()
+                for var_row in variables_rows:
+                    var_name, var_desc, var_data_type, var_is_required, var_default_value = var_row
+                    config_vars.append(ConfigVariable(var_name, var_desc, var_data_type, bool(var_is_required), var_default_value))
+                
+                comp = ESPHomeComponent(name, component_type, description, platforms, config_vars, url)
+                loaded_components[component_key] = comp
+            
+            conn.close()
+            self.components_data = loaded_components
+            self.log_message.emit(f"Successfully loaded {len(self.components_data)} components from database.")
+            return True
+        except sqlite3.Error as e:
+            self.log_message.emit(f"Error loading components from database: {e}")
+            return False
+
+    def reset_database(self):
+        """Clears all component and config variable data from the SQLite database."""
+        try:
+            conn = sqlite3.connect(self.DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("DROP TABLE IF EXISTS components")
+            cursor.execute("DROP TABLE IF EXISTS config_variables")
+            cursor.execute("DROP TABLE IF EXISTS yaml_configs")
+            conn.commit()
+            conn.close()
+            self.log_message.emit("Database tables dropped successfully.")
+            self._init_db()
+            self.log_message.emit("Database reset and re-initialized.")
+        except sqlite3.Error as e:
+            self.log_message.emit(f"Error resetting database: {e}")
+
+    def cancel_scraping(self):
+        self._is_canceled = True
+        self.log_message.emit("Scraping cancellation requested.")
+
+    def _scrape_page_for_links(self, url):
+        """Helper to fetch a page and return BeautifulSoup object."""
+        try:
+            response = requests.get(url, timeout=15)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            return soup
+        except requests.exceptions.RequestException as e:
+            self.log_message.emit(f"Error fetching {url}: {e}")
+            return None
+
+    def scrape_component_page(self, url):
+        """Scrapes a single component page for its configuration variables and platforms."""
+        self.log_message.emit(f"Scraping details from: {url}")
+        try:
+            soup = self._scrape_page_for_links(url)
+            if not soup:
+                return None
+
+            component_name_tag = soup.find('h1')
+            component_name = component_name_tag.text.strip().replace('¶', '') if component_name_tag else "Unknown Component"
+
+            path_parts = url.split('/')
+            component_type = "general"
+
+            if len(path_parts) >= 4 and path_parts[-3] == "components" and path_parts[-2] != "":
+                component_type = path_parts[-2]
+                self.log_message.emit(f"  Inferred component type from nested URL segment: '{component_type}' for {url}")
+            elif len(path_parts) >= 3 and path_parts[-2] == "components":
+                component_type = path_parts[-1].replace('.html', '')
+                self.log_message.emit(f"  Inferred component type from top-level component URL: '{component_type}' for {url}")
+            else:
+                self.log_message.emit(f"  Could not infer specific component type from URL: {url}. Defaulting to 'general'.")
+
+            if not component_name or component_name == "Unknown Component" or "esphome" in component_name.lower():
+                temp_name = path_parts[-1].replace('.html', '').replace('_', ' ').title()
+                if temp_name and temp_name != "Components":
+                    component_name = temp_name
+                    self.log_message.emit(f"  Component name derived from URL path: '{component_name}' for {url}")
+                else:
+                    self.log_message.emit(f"  Still unable to get specific component name for {url}. Using 'Unknown Component'.")
+                    component_name = "Unknown Component"
+
+            if component_type == "general" or component_type == "components" or component_type == "":
+                cleaned_name_for_type = component_name.lower().replace(' ', '_').replace('.', '_')
+                if cleaned_name_for_type and cleaned_name_for_type != "unknown_component":
+                    component_type = cleaned_name_for_type
+                    self.log_message.emit(f"  Final component type fallback to cleaned name: '{component_type}' for {url}")
+                else:
+                    component_type = "general_fallback"
+
+            description_tag = soup.find('p', class_='lead') or soup.find('p')
+            description = description_tag.text.strip().replace('¶', '') if description_tag else "No description available."
+
+            config_vars = []
+            
+            # Enhanced Parsing Logic for Configuration Variables
+            config_heading = soup.find(lambda tag: tag.name in ['h2', 'h3', 'h4'] and "Configuration variables:" in tag.get_text())
+            if config_heading:
+                self.log_message.emit(f"    Found 'Configuration variables:' heading on {url}.")
+                current_element = config_heading.next_sibling
+                while current_element:
+                    if isinstance(current_element, Tag):
+                        if current_element.name == 'dl' and 'option-list' in current_element.get('class', []):
+                            dt_tags = current_element.find_all('dt')
+                            dd_tags = current_element.find_all('dd')
+                            for dt, dd in zip(dt_tags, dd_tags):
+                                name_tag = dt.find('code', class_='descname')
+                                if name_tag:
+                                    name = name_tag.text.strip()
+                                    description_text = dd.text.strip()
+                                    
+                                    data_type = "string" # Default
+                                    type_match = re.search(r"\(.*?, (.*?)\)", dt.text)
+                                    if type_match:
+                                        data_type = type_match.group(1).lower().strip()
+                                    elif "boolean" in description_text.lower():
+                                        data_type = "boolean"
+                                    elif "integer" in description_text.lower() or "int" in description_text.lower():
+                                        data_type = "integer"
+                                    elif "float" in description_text.lower():
+                                        data_type = "float"
+                                    elif "time" in description_text.lower() and ("s" in description_text.lower() or "ms" in description_text.lower()):
+                                        data_type = "time"
+                                    elif "object" in description_text.lower() or "mapping" in description_text.lower():
+                                        data_type = "object"
+
+                                    is_required = "required" in dt.text.lower() or (dt.find('em', class_='property') and "required" in dt.find('em', class_='property').text.lower())
+
+                                    default_val = None
+                                    default_match = re.search(r"Defaults to (.*?)(?:\.|$)", description_text, re.IGNORECASE)
+                                    if default_match:
+                                        default_val = default_match.group(1).strip().strip('.')
+
+                                    if name and name not in {cv.name for cv in config_vars}:
+                                        config_vars.append(ConfigVariable(name, description_text, data_type, is_required, default_val))
+                                        self.log_message.emit(f"    Extracted DL variable: {name}")
+                            
+                        elif current_element.name == 'table':
+                            try:
+                                header_row = current_element.find('tr')
+                                if header_row and any(th.text.strip().lower() in ["name", "description", "type", "required"] for th in header_row.find_all('th')):
+                                    for row in current_element.find_all('tr')[1:]:
+                                        cols = row.find_all(['td', 'th'])
+                                        if len(cols) >= 4:
+                                            name = cols[0].text.strip()
+                                            desc = cols[1].text.strip()
+                                            data_type = cols[2].text.strip().lower()
+                                            is_required = "required" in cols[3].text.strip().lower()
+                                            default_val = cols[4].text.strip() if len(cols) > 4 else None
+                                            if name and name not in {cv.name for cv in config_vars}:
+                                                config_vars.append(ConfigVariable(name, desc, data_type, is_required, default_val))
+                                                self.log_message.emit(f"    Extracted Table variable: {name}")
+                            except Exception as e:
+                                self.log_message.emit(f"      Error parsing table within config section on {url}: {e}")
+                        
+                        if current_element.name in ['h1', 'h2', 'h3'] and current_element != config_heading:
+                            break
+                        if current_element.name == 'div' and ('docutils' in current_element.get('class', []) or 'section' in current_element.get('class', [])):
+                            pass
+                    
+                    current_element = current_element.next_sibling
+
+            for code_tag in soup.find_all('code', class_='docutils literal notranslate'):
+                var_name_candidate = code_tag.text.strip()
+                if re.match(r"^[a-z0-9_.-]+$", var_name_candidate) and len(var_name_candidate) > 1 and var_name_candidate not in ["true", "false", "null", "none", "id", "name", "platform"]:
+                    container_tag = code_tag.find_parent(['li', 'p'])
+                    if container_tag:
+                        full_text = container_tag.get_text().strip()
+                        
+                        match = re.search(rf"{re.escape(var_name_candidate)}\s*\((?:Required|Optional),\s*([^)]+)\):?\s*(.*)", full_text, re.IGNORECASE | re.DOTALL)
+                        
+                        desc = ""
+                        data_type = "string"
+                        is_required = "required" in full_text.lower()
+                        default_val = None
+
+                        if match:
+                            data_type_raw = match.group(1).lower().strip()
+                            desc = match.group(2).strip()
+                            
+                            data_type = data_type_raw.split(',')[0].strip().replace(')', '')
+                            
+                            if "boolean" in data_type: data_type = "boolean"
+                            elif "integer" in data_type or "int" in data_type: data_type = "integer"
+                            elif "float" in data_type: data_type = "float"
+                            elif "time" in data_type: data_type = "time"
+                            elif "list" in data_type: data_type = "list"
+                            elif "object" in data_type or "mapping" in data_type: data_type = "object"
+                            elif "id" in data_type and "id of" in desc.lower(): data_type = "ID"
+
+                            default_match = re.search(r"Defaults to (.*?)(?:\.|$)", desc, re.IGNORECASE)
+                            if default_match:
+                                default_val = default_match.group(1).strip().strip('.')
+                                desc = re.sub(r"Defaults to (.*?)(?:\.|$)", "", desc, flags=re.IGNORECASE).strip()
+
+                        else:
+                            desc = full_text.replace(var_name_candidate, '').strip()
+                            type_match_simple = re.search(r"\(([^)]+)\)", desc)
+                            if type_match_simple:
+                                data_type_raw = type_match_simple.group(1).lower().strip()
+                                data_type = data_type_raw.split(',')[0].strip().replace(')', '')
+                                desc = re.sub(r"\([^)]+\)", "", desc).strip()
+                            
+                            is_required = "required" in desc.lower()
+                            default_match = re.search(r"Defaults to (.*?)(?:\.|$)", desc, re.IGNORECASE)
+                            if default_match:
+                                default_val = default_match.group(1).strip().strip('.')
+                                desc = re.sub(r"Defaults to (.*?)(?:\.|$)", "", desc, flags=re.IGNORECASE).strip()
+
+                        if var_name_candidate and var_name_candidate not in {cv.name for cv in config_vars}:
+                            if len(desc) > 10 or (is_required or default_val is not None):
+                                config_vars.append(ConfigVariable(var_name_candidate, desc, data_type, is_required, default_val))
+                                self.log_message.emit(f"    Extracted Code Tag variable: {var_name_candidate} (Type: {data_type}, Required: {is_required}, Default: {default_val})")
+
+            existing_var_names = {cv.name for cv in config_vars}
+            if "platform" not in existing_var_names:
+                config_vars.append(ConfigVariable("platform", "The platform for this component.", "string", True))
+            if "name" not in existing_var_names:
+                config_vars.append(ConfigVariable("name", "The name of the entity.", "string", True))
+            if "id" not in existing_var_names:
+                config_vars.append(ConfigVariable("id", "The ID of the component.", "string", False))
+
+            platforms = []
+            if component_type not in ["general", "components", "general_fallback", ""]:
+                platforms.append(component_type)
+            
+            platform_var = next((v for v in config_vars if v.name == "platform"), None)
+            if platform_var and platform_var.description:
+                platform_list_match = re.search(r"(?:See the following for details:|platforms:)\s*(.*?)(?:\.|\n|$)", platform_var.description, re.IGNORECASE)
+                if platform_list_match:
+                    platform_names_raw = platform_list_match.group(1)
+                    extracted_platforms = re.split(r',\s*|\s+and\s*', platform_names_raw)
+                    for p_name in extracted_platforms:
+                        cleaned_p_name = p_name.strip()
+                        if cleaned_p_name and cleaned_p_name not in platforms:
+                            platforms.append(cleaned_p_name)
+                            self.log_message.emit(f"    Extracted additional platform: {cleaned_p_name}")
+
+            return ESPHomeComponent(component_name, component_type, description, platforms, config_vars, url)
+
+        except Exception as e:
+            self.log_message.emit(f"An unexpected error occurred while parsing {url}: {e}")
+            return None
+
+    def run_scraping(self):
+        """
+        Performs an integrated scrape of all component documentation pages.
+        Categories are discovered, and their components are immediately scraped for details.
+        """
+        self._is_canceled = False
+        self.status_update.emit("Starting integrated scraping process...")
+        self.progress_update.emit(0, 0, "Fetching main components page...")
+
+        try:
+            main_soup = self._scrape_page_for_links(self.COMPONENTS_URL)
+            if not main_soup:
+                self.log_message.emit(f"Failed to fetch main components page: {self.COMPONENTS_URL}")
+                self.scraping_finished.emit()
+                return
+
+            main_content_div = main_soup.find('div', class_='body') or main_soup.find('div', role='main')
+            if not main_content_div:
+                self.log_message.emit("Main content area not found. Cannot find categories or components.")
+                self.scraping_finished.emit()
+                return
+
+            component_links = []
+            for link in main_content_div.find_all('a', href=True):
+                href = link.get('href')
+                full_url = requests.compat.urljoin(self.COMPONENTS_URL, href)
+                # Only follow links that look like component documentation pages
+                if "components/" in full_url and full_url.endswith('.html') and '#' not in full_url:
+                    component_links.append(full_url)
+            
+            # Use a set to avoid scraping the same URL multiple times
+            unique_links = sorted(list(set(component_links)))
+            total_links = len(unique_links)
+            self.status_update.emit(f"Found {total_links} unique component pages to scrape.")
+            self.log_message.emit(f"Found {total_links} unique component pages to scrape.")
+            
+            processed_count = 0
+            for url in unique_links:
+                if self._is_canceled:
+                    break
+                
+                time.sleep(0.5) # Be kind to the server
+                
+                comp = self.scrape_component_page(url)
+                if comp:
+                    # Create a unique key for the component to store in the main dict
+                    key = f"{comp.component_type}.{comp.name.lower().replace(' ', '_').replace('.', '_')}"
+                    self.components_data[key] = comp
+                    self._save_single_component_to_db(comp)
+                    self.component_found.emit(key, comp)
+                
+                processed_count += 1
+                self.progress_update.emit(processed_count, total_links, f"Scraped {comp.name}...")
+
+        except Exception as e:
+            self.scraping_error.emit(f"An unexpected error occurred during scraping: {e}")
+            self.log_message.emit(f"An unexpected error occurred during scraping: {e}")
+        finally:
+            self.status_update.emit("Scraping finished.")
+            self.progress_update.emit(total_links, total_links, "Scraping complete.")
+            self.scraping_finished.emit()
+
+# --- 3. GUI Classes for the Application ---
+
+class ComponentGraphicItem(QGraphicsRectItem):
+    """
+    A visual representation of a component on the canvas.
+    It can be dragged and provides a context menu for configuration.
+    """
+    def __init__(self, component: ESPHomeComponent, canvas_scene: QGraphicsScene, key: str):
+        self.key = key
+        self.component_data = component
+        self.config_vars = component.config_vars  # Storing a reference to the list of variables
+        self.uuid = uuid.uuid4().hex  # Unique ID for this specific instance on the canvas
+        self.pos = QPointF(0, 0)
+        self.label_item = QGraphicsTextItem(f"{component.name}\n({component.component_type})", self)
+
+        # Set up the visual item
+        super().__init__(0, 0, 180, 80)
+        self.setPen(QPen(QColor(60, 60, 60), 2))
+        self.setBrush(QBrush(QColor(200, 220, 255)))
+        self.setFlags(
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable |
+            QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsRectItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setZValue(1)
+
+        # Center the text label
+        text_rect = self.label_item.boundingRect()
+        text_x = (self.rect().width() - text_rect.width()) / 2
+        text_y = (self.rect().height() - text_rect.height()) / 2
+        self.label_item.setPos(text_x, text_y)
+
+    def contextMenuEvent(self, event):
+        """Creates and shows a context menu for the component."""
+        menu = QMenu()
+        config_action = QAction("Configure...", self)
+        config_action.triggered.connect(lambda: self.show_config_dialog(event.screenPos()))
+        menu.addAction(config_action)
+        
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(self.delete_item)
+        menu.addAction(delete_action)
+        
+        menu.exec(event.screenPos())
+
+    def show_config_dialog(self, pos: QPoint):
+        """Opens a dialog to configure the component's variables."""
+        dialog = ComponentConfigDialog(self.component_data.name, self.config_vars, self.parentWidget())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # Update the component's variables with the values from the dialog
+            self.component_data.config_vars = dialog.get_configured_variables()
+            print(f"Updated configuration for {self.component_data.name}:")
+            for var in self.component_data.config_vars:
+                print(f"  - {var.name}: {var.current_value}")
+            
+    def delete_item(self):
+        """Removes this item from the scene."""
+        self.scene().removeItem(self)
+
+    def itemChange(self, change, value):
+        """
+        Override this to handle changes to the item's position,
+        which is useful for saving the state of the canvas.
+        """
+        if change == QGraphicsRectItem.GraphicsItemChange.ItemPositionChange:
+            self.pos = value
+        
+        return super().itemChange(change, value)
+
+
+class ComponentConfigDialog(QDialog):
+    """
+    A dialog for configuring the variables of a component.
+    It dynamically generates input widgets based on the variable's data type.
+    """
+    def __init__(self, component_name, config_vars, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Configure {component_name}")
+        self.setMinimumWidth(400)
+        self.config_vars = config_vars
+        
+        main_layout = QVBoxLayout()
+        form_layout = QFormLayout()
+
+        for var in self.config_vars:
+            label_text = f"{var.name}"
+            if var.is_required:
+                label_text += " (*)"
+            label = QLabel(label_text)
+            
+            input_widget = self._create_input_widget(var)
+            
+            form_layout.addRow(label, input_widget)
+            
+        main_layout.addLayout(form_layout)
+        
+        button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        main_layout.addWidget(button_box)
+        
+        self.setLayout(main_layout)
+
+    def _create_input_widget(self, var):
+        """Creates an appropriate input widget based on the variable's data type."""
+        widget = None
+        if var.data_type == "boolean":
+            widget = QCheckBox()
+            if var.default_value is not None:
+                widget.setChecked(var.default_value.lower() == "true")
+            elif var.current_value is not None:
+                widget.setChecked(var.current_value)
+        elif var.data_type == "integer":
+            widget = QSpinBox()
+            widget.setRange(-99999, 99999)
+            if var.default_value is not None:
+                widget.setValue(int(var.default_value))
+            elif var.current_value is not None:
+                widget.setValue(var.current_value)
+        elif var.data_type == "float":
+            widget = QDoubleSpinBox()
+            widget.setRange(-99999.0, 99999.0)
+            widget.setDecimals(3)
+            if var.default_value is not None:
+                widget.setValue(float(var.default_value))
+            elif var.current_value is not None:
+                widget.setValue(var.current_value)
+        else: # Default to a LineEdit for string, time, object, etc.
+            widget = QLineEdit()
+            if var.default_value is not None:
+                widget.setText(var.default_value)
+            elif var.current_value is not None:
+                widget.setText(str(var.current_value))
+        
+        # Store a reference to the original variable on the widget
+        widget.var_name = var.name
+        return widget
+
+    def get_configured_variables(self):
+        """Retrieves the values from the input widgets and updates the config_vars."""
+        for i in range(self.layout().itemAt(0).rowCount()):
+            label_item = self.layout().itemAt(0).itemAt(i, QFormLayout.ItemRole.LabelRole)
+            field_item = self.layout().itemAt(0).itemAt(i, QFormLayout.ItemRole.FieldRole)
+            
+            label_widget = label_item.widget()
+            field_widget = field_item.widget()
+            
+            if field_widget:
+                var = next((v for v in self.config_vars if v.name == field_widget.var_name), None)
+                if var:
+                    if isinstance(field_widget, QCheckBox):
+                        var.current_value = field_widget.isChecked()
+                    elif isinstance(field_widget, QSpinBox):
+                        var.current_value = field_widget.value()
+                    elif isinstance(field_widget, QDoubleSpinBox):
+                        var.current_value = field_widget.value()
+                    elif isinstance(field_widget, QLineEdit):
+                        var.current_value = field_widget.text()
+                    # Add other types here as needed (e.g., QComboBox for enums)
+        
+        return self.config_vars
+
+
+class ComponentTreeWidget(QTreeWidget):
+    """A tree widget that supports drag-and-drop for components."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(False)
+        self.setHeaderLabels(["Component", "Type"])
+        self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+
+    def startDrag(self, dropActions):
+        """Handle the start of a drag operation."""
+        item = self.currentItem()
+        if not item or item.parent() is None: # Only allow dragging of child items (the actual components)
+            return
+
+        drag_data_key = item.data(0, Qt.ItemDataRole.UserRole)
+        if not drag_data_key:
+            return
+
+        mime_data = QMimeData()
+        
+        # Encode the string to a byte array before adding it to QMimeData
+        byte_array = QByteArray(drag_data_key.encode('utf-8'))
+        mime_data.setData("application/x-esphome-component", byte_array)
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        
+        drag_pixmap = QPixmap(30, 30)
+        drag_pixmap.fill(Qt.GlobalColor.white)
+        painter = QPainter(drag_pixmap)
+        painter.setBrush(QBrush(QColor(100, 100, 255)))
+        painter.drawEllipse(0, 0, 30, 30)
+        painter.end()
+        drag.setPixmap(drag_pixmap)
+
+        drag.exec(Qt.DropAction.CopyAction)
+
+class ComponentCanvas(QGraphicsView):
+    """
+    The central canvas for dropping and arranging components.
+    This class has been updated with the fix for the AttributeError.
+    """
+    componentDropped = pyqtSignal(str, QPointF)
+    sceneChanged = pyqtSignal()
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setScene(QGraphicsScene(self))
+        self.setSceneRect(QRectF(0, 0, 2000, 2000))
+        self.setBackgroundBrush(QBrush(QColor(240, 240, 240)))
+        
+        # --- FIX: Integrated try-except block for compatibility ---
+        # The original code produced an AttributeError on some systems.
+        # This checks if HighQualityAntialiasing is available, and if not,
+        # falls back to a standard Antialiasing setting.
+        try:
+            render_hint = QPainter.RenderHint.HighQualityAntialiasing
+        except AttributeError:
+            render_hint = QPainter.RenderHint.Antialiasing
+
+        # Use the selected render hint
+        self.setRenderHint(render_hint)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        self.scene().sceneRectChanged.connect(self.sceneChanged.emit)
+
+    def dragEnterEvent(self, event):
+        """Accept drops if the MIME data is our custom type."""
+        if event.mimeData().hasFormat("application/x-esphome-component"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        """Show that we can drop here."""
+        if event.mimeData().hasFormat("application/x-esphome-component"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        """
+        Create a new component item on the canvas when dropped.
+        This method has been completed to handle the drop data and emit a signal.
+        """
+        if event.mimeData().hasFormat("application/x-esphome-component"):
+            # Decode the byte array back to a string
+            byte_array = event.mimeData().data("application/x-esphome-component")
+            component_key = str(byte_array.data().decode('utf-8'))
+            
+            # Get the drop position in scene coordinates and emit the signal
+            drop_pos = self.mapToScene(event.position().toPoint())
+            self.componentDropped.emit(component_key, drop_pos)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def parentWidget(self):
+        """
+        Helper method to get the parent widget, useful for modal dialogs.
+        """
+        return self.parent().parentWidget()
+
+
+class ESPHomeConfiguratorApp(QMainWindow):
+    """
+    The main application window for the ESPHome Configurator.
+    It orchestrates the scraper, GUI, and YAML generation.
+    """
+    def __init__(self, scraper: ESPHomeScraper):
+        super().__init__()
+        self.scraper = scraper
+        self.scraped_components = {}
+        self.components_on_canvas = {}
+        self.yaml_config_history = deque(maxlen=20)
+        self.current_yaml_version = 0
+        self.yaml_config_id = "default_config"
+
+        # Connect scraper signals to UI slots
+        self.scraper.log_message.connect(self.log_message)
+        self.scraper.status_update.connect(self.statusBar().showMessage)
+        self.scraper.progress_update.connect(self.update_progress)
+        self.scraper.component_found.connect(self.add_component_to_tree)
+        self.scraper.scraping_finished.connect(self.on_scraping_finished)
+        self.scraper.scraping_error.connect(self.on_scraping_error)
+        
+        self.init_ui()
+        self.load_components_on_startup()
+
+    def init_ui(self):
+        """Initializes the main application GUI."""
+        self.setWindowTitle("ESPHome Configurator")
+        self.setMinimumSize(1200, 800)
+
+        # --- Central Widget and Layouts ---
+        central_widget = QWidget()
+        main_layout = QHBoxLayout()
+        central_widget.setLayout(main_layout)
+        self.setCentralWidget(central_widget)
+
+        # --- Left Panel: Component Tree & Controls ---
+        left_panel = QFrame()
+        left_panel.setMinimumWidth(300)
+        left_panel.setMaximumWidth(400)
+        left_panel_layout = QVBoxLayout()
+        left_panel.setLayout(left_panel_layout)
+        
+        # Component Tree
+        self.component_tree = ComponentTreeWidget()
+        left_panel_layout.addWidget(self.component_tree)
+        
+        # Scraper Controls
+        scraper_controls = QHBoxLayout()
+        self.scrape_button = QPushButton("Scrape All Components")
+        self.scrape_button.clicked.connect(self.start_scraping)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.scraper.cancel_scraping)
+        scraper_controls.addWidget(self.scrape_button)
+        scraper_controls.addWidget(self.cancel_button)
+        left_panel_layout.addLayout(scraper_controls)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        left_panel_layout.addWidget(self.progress_bar)
+        
+        # Log Viewer
+        log_label = QLabel("Scraper Logs:")
+        left_panel_layout.addWidget(log_label)
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        left_panel_layout.addWidget(self.log_viewer)
+
+        # --- Middle Panel: Canvas & Toolbar ---
+        middle_panel = QVBoxLayout()
+        
+        # Canvas Toolbar
+        self.canvas_toolbar = QToolBar("Canvas Actions")
+        self.addToolBar(self.canvas_toolbar)
+        self.zoom_in_action = QAction(QIcon.fromTheme("zoom-in"), "Zoom In", self)
+        self.zoom_in_action.triggered.connect(self.zoom_in)
+        self.zoom_out_action = QAction(QIcon.fromTheme("zoom-out"), "Zoom Out", self)
+        self.zoom_out_action.triggered.connect(self.zoom_out)
+        self.canvas_toolbar.addAction(self.zoom_in_action)
+        self.canvas_toolbar.addAction(self.zoom_out_action)
+        
+        # Component Canvas
+        self.canvas = ComponentCanvas()
+        self.canvas.componentDropped.connect(self.on_component_dropped)
+        middle_panel.addWidget(self.canvas)
+
+        # --- Right Panel: YAML Viewer & Controls ---
+        right_panel = QFrame()
+        right_panel.setMinimumWidth(400)
+        right_panel_layout = QVBoxLayout()
+        right_panel.setLayout(right_panel_layout)
+        
+        yaml_label = QLabel("Generated YAML Configuration:")
+        right_panel_layout.addWidget(yaml_label)
+        self.yaml_viewer = QTextEdit()
+        self.yaml_viewer.setReadOnly(False)
+        self.yaml_viewer.setFont(QFont("Courier New", 10))
+        right_panel_layout.addWidget(self.yaml_viewer)
+
+        # YAML controls
+        yaml_controls = QHBoxLayout()
+        self.generate_yaml_button = QPushButton("Generate YAML")
+        self.generate_yaml_button.clicked.connect(self.generate_yaml)
+        yaml_controls.addWidget(self.generate_yaml_button)
+        
+        self.save_yaml_button = QPushButton("Save Config")
+        self.save_yaml_button.clicked.connect(self.save_yaml)
+        yaml_controls.addWidget(self.save_yaml_button)
+        
+        self.load_yaml_button = QPushButton("Load Config")
+        self.load_yaml_button.clicked.connect(self.load_yaml)
+        yaml_controls.addWidget(self.load_yaml_button)
+        
+        right_panel_layout.addLayout(yaml_controls)
+
+        main_layout.addWidget(left_panel)
+        main_layout.addLayout(middle_panel)
+        main_layout.addWidget(right_panel)
+
+        self.setStatusBar(QStatusBar())
+        self.statusBar().showMessage("Ready.")
+
+    def load_components_on_startup(self):
+        """Loads components from the database on app startup."""
+        self.log_message("Attempting to load components from the local database...")
+        success = self.scraper.load_components_from_db()
+        if success and self.scraper.components_data:
+            self.scraped_components = self.scraper.components_data
+            self.log_message(f"Successfully loaded {len(self.scraped_components)} components from the database.")
+            self.populate_component_tree()
+            self.statusBar().showMessage("Components loaded from database. Ready.")
+        else:
+            self.log_message("No components found in the database. Please scrape the documentation.")
+            self.statusBar().showMessage("No components found. Please scrape the documentation.")
+
+    def start_scraping(self):
+        """Starts the scraping process in a separate thread."""
+        self.log_viewer.clear()
+        self.scrape_thread = QThread()
+        self.scraper.moveToThread(self.scrape_thread)
+        self.scrape_thread.started.connect(self.scraper.run_scraping)
+        self.scraper.scraping_finished.connect(self.scrape_thread.quit)
+        self.scraper.scraping_finished.connect(self.scrape_thread.deleteLater)
+        self.cancel_button.setEnabled(True)
+        self.scrape_button.setEnabled(False)
+        self.scrape_thread.start()
+
+    def on_scraping_finished(self):
+        """Handler for when the scraping thread finishes."""
+        self.scrape_button.setEnabled(True)
+        self.cancel_button.setEnabled(False)
+        self.log_message("Scraping thread finished.")
+        self.scraped_components = self.scraper.components_data
+        self.populate_component_tree()
+
+    def on_scraping_error(self, message):
+        """Handler for scraping errors."""
+        self.log_message(f"Scraping Error: {message}")
+        QMessageBox.critical(self, "Scraping Error", message)
+
+    def populate_component_tree(self):
+        """Populates the QTreeWidget with the scraped component data."""
+        self.component_tree.clear()
+        component_types = sorted(list(set(c.component_type for c in self.scraped_components.values())))
+        
+        for comp_type in component_types:
+            type_item = QTreeWidgetItem(self.component_tree, [comp_type])
+            
+            for key, comp in sorted(self.scraped_components.items()):
+                if comp.component_type == comp_type:
+                    child_item = QTreeWidgetItem(type_item, [comp.name, comp.component_type])
+                    child_item.setData(0, Qt.ItemDataRole.UserRole, key)
+                    child_item.setToolTip(0, comp.description)
+
+    def on_component_dropped(self, component_key: str, pos: QPointF):
+        """
+        Creates a new graphical item for a component and places it on the canvas.
+        """
+        if component_key in self.scraped_components:
+            comp_template = self.scraped_components[component_key]
+            
+            # Create a deep copy to ensure each item is a unique instance
+            comp_instance = ESPHomeComponent(
+                name=comp_template.name,
+                component_type=comp_template.component_type,
+                description=comp_template.description,
+                platforms=comp_template.platforms.copy(),
+                config_vars=[ConfigVariable(v.name, v.description, v.data_type, v.is_required, v.default_value) for v in comp_template.config_vars],
+                url=comp_template.url
+            )
+            
+            # The Graphic Item's role is to hold the component instance
+            new_item = ComponentGraphicItem(comp_instance, self.canvas.scene(), component_key)
+            new_item.setPos(pos)
+            self.canvas.scene().addItem(new_item)
+            
+            self.components_on_canvas[new_item.uuid] = new_item
+            self.log_message(f"Added new instance of '{comp_instance.name}' to canvas.")
+
+    def log_message(self, message):
+        """Appends a timestamped message to the log viewer."""
+        timestamp = datetime.now().strftime("[%H:%M:%S] ")
+        self.log_viewer.append(f"{timestamp}{message}")
+        self.scraper._save_log_to_db(message)
+
+    def update_progress(self, current, total, message):
+        """Updates the progress bar and status bar."""
+        if total > 0:
+            progress = int((current / total) * 100)
+            self.progress_bar.setValue(progress)
+            self.statusBar().showMessage(message)
+
+    def generate_yaml(self):
+        """Generates a YAML configuration from the components on the canvas."""
+        yaml_data = {}
+        
+        # Add basic ESPHome config, like esphome, wifi, ota
+        if not self.components_on_canvas:
+            self.log_message("No components on the canvas to generate YAML from.")
+            self.yaml_viewer.clear()
+            return
+            
+        yaml_data["esphome"] = {"name": "esphome-device", "platform": "ESP32", "board": "nodemcu-32s"}
+        yaml_data["wifi"] = {"ssid": "Your_SSID", "password": "Your_Password"}
+        yaml_data["ota"] = None # No config needed, just enable
+
+        # Iterate over components on the canvas and build the YAML structure
+        for comp_uuid, comp_item in self.components_on_canvas.items():
+            comp_data = comp_item.component_data
+            comp_type = comp_data.component_type
+            
+            # Initialize a list for the component type if it doesn't exist
+            if comp_type not in yaml_data:
+                yaml_data[comp_type] = []
+                
+            comp_dict = {}
+            for var in comp_data.config_vars:
+                # Use the current value if set, otherwise use the default
+                if var.current_value is not None:
+                    value_to_use = var.current_value
+                elif var.default_value is not None:
+                    value_to_use = var.default_value
+                else:
+                    value_to_use = "" # Placeholder for unset required values
+                
+                # Special handling for "ID" variables
+                if var.name == "id":
+                    comp_dict[var.name] = {"id": comp_item.uuid}
+                else:
+                    # Simple case: key-value pair
+                    comp_dict[var.name] = value_to_use
+
+            # Append the new component dictionary to the list for its type
+            if yaml_data[comp_type] is None:
+                 yaml_data[comp_type] = comp_dict
+            elif isinstance(yaml_data[comp_type], list):
+                 yaml_data[comp_type].append(comp_dict)
+            else: # It's a single item, turn it into a list
+                current_item = yaml_data[comp_type]
+                yaml_data[comp_type] = [current_item, comp_dict]
+        
+        # Convert the dictionary to a YAML string
+        try:
+            yaml_string = yaml.dump(yaml_data, indent=2, sort_keys=False)
+            self.yaml_viewer.setText(yaml_string)
+            self.log_message("YAML configuration generated successfully.")
+        except yaml.YAMLError as e:
+            self.log_message(f"Error generating YAML: {e}")
+            QMessageBox.critical(self, "YAML Error", f"Could not generate YAML: {e}")
+        
+    def save_yaml(self):
+        """Saves the current YAML config to the database."""
+        yaml_string = self.yaml_viewer.toPlainText()
+        if not yaml_string:
+            QMessageBox.warning(self, "No Config to Save", "The YAML viewer is empty. Generate a configuration first.")
+            return
+
+        config_id, ok = QInputDialog.getText(self, "Save Configuration", "Enter a name for this configuration:")
+        if ok and config_id:
+            if self.scraper.save_yaml_config(config_id, yaml_string):
+                self.yaml_config_id = config_id
+                self.log_message(f"YAML configuration '{config_id}' saved successfully.")
+            else:
+                QMessageBox.critical(self, "Save Error", "Failed to save the configuration to the database.")
+
+    def load_yaml(self):
+        """Loads a YAML config from the database and reconstructs the canvas."""
+        # This is a complex operation that requires recreating the canvas state
+        # A simple approach for this example is to just load and display the YAML text.
+        config_id, ok = QInputDialog.getText(self, "Load Configuration", "Enter the name of the configuration to load:")
+        if ok and config_id:
+            yaml_string = self.scraper.load_yaml_config(config_id)
+            if yaml_string:
+                self.yaml_viewer.setText(yaml_string)
+                self.yaml_config_id = config_id
+                self.log_message(f"Configuration '{config_id}' loaded into YAML viewer.")
+            else:
+                QMessageBox.warning(self, "Load Error", f"No configuration found with the ID '{config_id}'.")
+
+    def zoom_in(self):
+        """Zooms the canvas in."""
+        self.canvas.scale(1.2, 1.2)
+
+    def zoom_out(self):
+        """Zooms the canvas out."""
+        self.canvas.scale(1 / 1.2, 1 / 1.2)
+
+# --- Main Application Entry Point ---
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    
+    scraper = ESPHomeScraper()
+    scraper_thread = QThread()
+    
+    main_window = ESPHomeConfiguratorApp(scraper)
+    main_window.show()
+    
+    sys.exit(app.exec())
