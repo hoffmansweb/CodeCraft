@@ -201,6 +201,10 @@ class YAMLEditor(QWidget):
         """Set up the editor UI."""
         layout = QVBoxLayout(self)
         
+        # Create text editor first (needed for toolbar connections)
+        self.text_edit = QTextEdit()
+        self.setup_editor()
+        
         # Toolbar
         self.create_toolbar(layout)
         
@@ -212,9 +216,7 @@ class YAMLEditor(QWidget):
         editor_widget = QWidget()
         editor_layout = QVBoxLayout(editor_widget)
         
-        # Text editor
-        self.text_edit = QTextEdit()
-        self.setup_editor()
+        # Add the already created text editor
         editor_layout.addWidget(self.text_edit)
         
         splitter.addWidget(editor_widget)

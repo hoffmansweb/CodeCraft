@@ -213,19 +213,22 @@ class ComponentCanvas(QGraphicsView):
         """Draw a grid on the canvas."""
         painter.setPen(QPen(QColor(200, 200, 200), 1, Qt.PenStyle.DotLine))
         
-        # Vertical lines
+        # Convert rect coordinates to integers for consistent drawing
         left = int(rect.left()) - (int(rect.left()) % self.grid_size)
         top = int(rect.top()) - (int(rect.top()) % self.grid_size)
+        right = int(rect.right())
+        bottom = int(rect.bottom())
         
+        # Vertical lines
         x = left
-        while x < rect.right():
-            painter.drawLine(x, rect.top(), x, rect.bottom())
+        while x < right:
+            painter.drawLine(x, top, x, bottom)
             x += self.grid_size
         
         # Horizontal lines
         y = top
-        while y < rect.bottom():
-            painter.drawLine(rect.left(), y, rect.right(), y)
+        while y < bottom:
+            painter.drawLine(left, y, right, y)
             y += self.grid_size
     
     def add_component(self, component: ESPHomeComponent, x: Optional[float] = None, y: Optional[float] = None):

@@ -96,16 +96,19 @@ QTreeWidget::item:selected {
     color: white;
 }
 
+/* Simplified tree widget branches without image dependencies */
 QTreeWidget::branch:has-siblings:!adjoins-item {
-    border-image: url(vline.png) 0;
+    border-left: 1px solid #ddd;
 }
 
 QTreeWidget::branch:has-siblings:adjoins-item {
-    border-image: url(branch-more.png) 0;
+    border-left: 1px solid #ddd;
+    border-bottom: 1px solid #ddd;
 }
 
 QTreeWidget::branch:!has-children:!has-siblings:adjoins-item {
-    border-image: url(branch-end.png) 0;
+    border-left: 1px solid #ddd;
+    border-bottom: 1px solid #ddd;
 }
 
 /* Text Edits */
@@ -153,7 +156,6 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: url(down-arrow.png);
     width: 12px;
     height: 12px;
 }
@@ -507,14 +509,4 @@ QWidget[darkTheme="true"] QLineEdit {
     color: #ecf0f1;
 }
 
-/* Responsive design adjustments */
-@media (max-width: 800px) {
-    QPushButton {
-        padding: 6px 12px;
-        min-width: 60px;
-    }
-    
-    QGroupBox {
-        font-size: 12px;
-    }
-}
+/* Responsive design adjustments - Note: @media not supported in Qt, using standard styling */

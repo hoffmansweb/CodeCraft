@@ -182,7 +182,7 @@ class ConfigValidator:
         
         return True, None
     
-    def validate_by_type(self, value: Any, data_type: str, context: Dict[str, Any] = None) -> Tuple[bool, Optional[str]]:
+    def validate_by_type(self, value: Any, data_type: str, context: Optional[Dict[str, Any]] = None) -> Tuple[bool, Optional[str]]:
         """Validate a value based on its data type."""
         if context is None:
             context = {}

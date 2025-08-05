@@ -2,7 +2,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-25_05"
-packages = ["libyaml"]
+packages = ["libyaml", "xcodebuild", "zlib", "mesa", "xorg.libX11", "xorg.libXext", "xorg.libXrender", "xorg.libXi", "xorg.libXtst", "fontconfig", "freetype", "libglvnd", "xvfb-run", "libxkbcommon", "zstd", "dbus"]
 
 [workflows]
 runButton = "Project"
@@ -26,7 +26,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python main.py"
+args = "QT_QPA_PLATFORM=offscreen xvfb-run -a python main.py"
 
 [[workflows.workflow]]
 name = "main"

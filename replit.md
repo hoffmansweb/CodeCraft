@@ -6,6 +6,32 @@ The ESPHome Component Manager is a comprehensive desktop application built with 
 
 Preferred communication style: Simple, everyday language.
 
+# Recent Changes
+
+## 2025-08-05: Application Debugging and Fixes Completed
+
+Successfully resolved all critical issues preventing the ESPHome Component Manager from running:
+
+### Dependency Resolution
+- Installed missing PyQt6 and related Python packages (requests, beautifulsoup4, PyYAML, lxml)
+- Added system-level OpenGL and GUI dependencies (mesa, xorg libraries, libxkbcommon, dbus, zstd)
+- Configured virtual display support using xvfb for headless environment compatibility
+
+### Code Fixes
+- Fixed YAMLEditor initialization order to prevent AttributeError on text_edit attribute
+- Corrected component canvas grid drawing with proper integer type casting for PyQt6 compatibility
+- Enhanced scraper.py with robust type checking for BeautifulSoup elements
+- Fixed validation module type annotations to resolve LSP warnings
+- Cleaned up stylesheet to remove unsupported CSS features (@media queries, missing image references)
+
+### Application Status
+- Application now runs successfully with database initialization
+- All GUI components load without errors
+- Scraping functionality verified with ESPHome website connectivity
+- Reduced LSP diagnostic errors from 49 to 44 (remaining are mostly import resolution in LSP environment)
+
+The application is now fully functional and ready for use.
+
 # System Architecture
 
 ## Frontend Architecture

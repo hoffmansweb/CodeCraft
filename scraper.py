@@ -84,39 +84,43 @@ class ESPHomeScraper(QObject):
             # Look for component links in various potential locations
             # Method 1: Links in main content area
             content_area = soup.find('div', class_='rst-content')
-            if content_area:
+            if content_area and hasattr(content_area, 'find_all'):
                 links = content_area.find_all('a', href=True)
                 for link in links:
-                    href = link.get('href', '')
-                    if href.startswith('/components/') and href.count('/') >= 2:
-                        full_url = urljoin(self.BASE_URL, href)
-                        link_text = link.get_text(strip=True)
-                        if link_text and not link_text.startswith('#'):
-                            component_links.append((link_text, full_url))
+                    if hasattr(link, 'get'):
+                        href = link.get('href', '')
+                        if href.startswith('/components/') and href.count('/') >= 2:
+                            full_url = urljoin(self.BASE_URL, href)
+                            link_text = link.get_text(strip=True)
+                            if link_text and not link_text.startswith('#'):
+                                component_links.append((link_text, full_url))
             
             # Method 2: Look for toctree or component listings
             toctree = soup.find('div', class_='toctree-wrapper')
-            if toctree:
+            if toctree and hasattr(toctree, 'find_all'):
                 links = toctree.find_all('a', href=True)
                 for link in links:
-                    href = link.get('href', '')
-                    if '/components/' in href:
-                        full_url = urljoin(self.BASE_URL, href)
-                        link_text = link.get_text(strip=True)
-                        if link_text and not link_text.startswith('#'):
-                            component_links.append((link_text, full_url))
+                    if hasattr(link, 'get'):
+                        href = link.get('href', '')
+                        if '/components/' in href:
+                            full_url = urljoin(self.BASE_URL, href)
+                            link_text = link.get_text(strip=True)
+                            if link_text and not link_text.startswith('#'):
+                                component_links.append((link_text, full_url))
             
             # Method 3: Look for navigation menus
             nav_menus = soup.find_all(['nav', 'ul'], class_=re.compile(r'nav|menu|toc'))
             for menu in nav_menus:
-                links = menu.find_all('a', href=True)
-                for link in links:
-                    href = link.get('href', '')
-                    if '/components/' in href and href.count('/') >= 2:
-                        full_url = urljoin(self.BASE_URL, href)
-                        link_text = link.get_text(strip=True)
-                        if link_text and not link_text.startswith('#'):
-                            component_links.append((link_text, full_url))
+                if hasattr(menu, 'find_all'):
+                    links = menu.find_all('a', href=True)
+                    for link in links:
+                        if hasattr(link, 'get'):
+                            href = link.get('href', '')
+                            if '/components/' in href and href.count('/') >= 2:
+                                full_url = urljoin(self.BASE_URL, href)
+                                link_text = link.get_text(strip=True)
+                                if link_text and not link_text.startswith('#'):
+                                    component_links.append((link_text, full_url))
             
             # Remove duplicates while preserving order
             seen = set()
@@ -130,6 +134,7 @@ class ESPHomeScraper(QObject):
             
         except Exception as e:
             self.logger.error(f"Error extracting component links: {e}")
+            unique_links = []
         
         return unique_links
     
@@ -410,7 +415,7 @@ class ESPHomeScraper(QObject):
         
         return 'string'
     
-    def _extract_platforms(self, soup: BeautifulSoup, clean_content: str = None) -> List[str]:
+    def _extract_platforms(self, soup: BeautifulSoup, clean_content: Optional[str] = None) -> List[str]:
         """Extract supported platforms from component page."""
         platforms = []
         
@@ -483,11 +488,11 @@ class ESPHomeScraper(QObject):
             if not description:
                 # Fallback to HTML extraction
                 meta_desc = soup.find('meta', attrs={'name': 'description'})
-                if meta_desc:
-                    description = meta_desc.get('content', '')
+                if meta_desc and hasattr(meta_desc, 'get'):
+                    description = meta_desc.get('content', '') or ""
                 else:
                     first_p = soup.find('p')
-                    if first_p:
+                    if first_p and hasattr(first_p, 'get_text'):
                         description = first_p.get_text(strip=True)[:200] + "..."
             
             # Extract configuration variables using multiple methods
@@ -503,10 +508,13 @@ class ESPHomeScraper(QObject):
             # Extract supported platforms
             platforms = self._extract_platforms(soup, clean_content)
             
+            # Ensure description is a string
+            final_description = description if isinstance(description, str) else str(description) if description else "No description available"
+            
             component = ESPHomeComponent(
                 name=component_name,
                 component_type=component_type,
-                description=description,
+                description=final_description,
                 platforms=platforms,
                 config_vars=config_vars,
                 url=url
